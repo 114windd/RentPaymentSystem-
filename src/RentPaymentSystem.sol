@@ -3,23 +3,76 @@ pragma solidity ^0.8.24;
 /**
  * @title RentPaymentSystem
  * @author Korede
- * @notice
+ * @notice A decentralized rent payment system with Chainlink price feeds and automation
  */
 
-import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+import {AggregatorV3Interface} from "../lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
+import {AutomationCompatibleInterface} from "../lib/chainlink-evm/contracts/src/v0.8/automation/interfaces/AutomationCompatibleInterface.sol";
+import {PriceConverter} from "./PriceConverter.sol";
 
-contract RentPaymentSystem {
+contract RentPaymentSystem is AutomationCompatibleInterface {
+    AggregatorV3Interface public priceFeed;
     uint256 public nextAgreementID;
-    mapping(uint256 agreementID => TenancyAgreement agreement) agreements;
-    mapping(address landlordAddress => Tenant[] tenants) landlordToTenants;
-    mapping(address => Landlord) landlordProfiles;
-    mapping(address => Tenant) tenantProfiles;
+
+    // Individual balance tracking
+    mapping(address tenantAddress => mapping(address landlordAddress => uint256 rentAmount))
+        public rentBalance; // tenant => landlord => rent amount
+    mapping(address => uint256) public depositBalance; // tenant => deposit amount
+    mapping(address => bool) public isDepositPaid; // tenant => deposit status
+
+    // Existing mappings
+    mapping(uint256 agreementID => TenancyAgreement agreement)
+        public agreements;
+    mapping(address landlordAddress => Tenant[] tenants)
+        public landlordToTenants;
+    mapping(address tenantAddress => Landlord landlord) public tenantToLandlord;
+    mapping(address landlordProfiles => Landlord) public landlordProfiles;
+    mapping(address tenantAddress => Tenant) public tenantProfiles;
+    mapping(address landlordAddress => TenancyAgreement[])
+        public landlordToAgreement;
+    mapping(address tenantAddress => mapping(address landlordAddress => TenancyAgreement))
+        public masterAgreements;
+
+    // Custom Errors (Gas Efficient)
+    error OnlyLandlordAllowed();
+    error OnlyTenantAllowed();
+    error AgreementDoesNotExist();
+    error LandlordProfileAlreadyExists();
+    error TenantProfileAlreadyExists();
+    error LandlordProfileDoesNotExist();
+    error TenantProfileDoesNotExist();
+    error StartDateMustBeBeforeEndDate();
+    error DueDateMustBeBeforeOrEqualToEndDate();
+    error StartDateMustBeBeforeDueDate();
+    error TenantAndLandlordCannotBeSame();
+    error AgreementAlreadyExists();
+    error RentAlreadyPaid();
+    error DepositMustBePaidFirst();
+    error NotEnoughETHSent();
+    error DepositAlreadyPaid();
+    error RentNotPaid();
+    error CannotWithdrawBeforeDueDate();
+    error NoRentToWithdraw();
+    error TransferFailed();
+    error LeaseStillActive();
+    error NoDepositToRefund();
+    error NoDepositBalance();
+    error DepositRefundFailed();
+    error PaymentNotYetDue();
+    error PaymentAlreadyMade();
 
     enum rentPaymentStatus {
         PENDING,
         PAID,
         OVERDUE
     }
+
+    // Events
+    event DepositPaid(
+        address indexed tenantAddress,
+        address indexed landlordAddress,
+        uint256 amountPaid
+    );
 
     event AgreementCreated(
         uint256 indexed agreementID,
@@ -28,44 +81,102 @@ contract RentPaymentSystem {
         uint256 rentUSD,
         uint256 depositUSD
     );
-    //Landlord
+
+    event RentPaid(
+        address indexed tenantAddress,
+        address indexed landlordAddress,
+        uint256 indexed amountPaid
+    );
+
+    event RentWithdrawn(
+        address indexed landlordAddress,
+        address indexed tenantAddress,
+        uint256 amount
+    );
+
+    event DepositRefunded(
+        address indexed tenantAddress,
+        address indexed landlordAddress,
+        uint256 amount
+    );
+
+    event LatePayment(
+        address indexed tenantAddress,
+        address indexed landlordAddress,
+        uint256 dueDate
+    );
+
+    event RentReleased(
+        address indexed landlordAddress,
+        address indexed tenantAddress,
+        uint256 amount
+    );
+
+    // Structs
     struct Landlord {
         address landlordAddress;
         string landlordName;
         string landlordContact;
     }
-    //Tenant(s)
+
     struct Tenant {
         address tenantAddress;
         string tenantName;
         string tenantEmail;
         address LandlordAddress;
     }
-    //Tenancy Agreement
+
     struct TenancyAgreement {
-        uint256 startDate; //Start of tenancy
-        uint256 endDate; // End of tenancy
-        uint256 dueDate; // Date rent is due
-        uint256 period; //period in which one has to pay rent (30 days)
-        uint256 rentUSD; // Rent amount USD
-        uint256 rentETH; // Rent amount ETH
-        uint256 depositUSD; // Deposit Amount USD
-        uint256 depositETH; // Deposit Amount ETH
+        uint256 startDate;
+        uint256 endDate;
+        uint256 dueDate;
+        uint256 period;
+        uint256 rentUSD;
+        uint256 rentETH;
+        uint256 depositUSD;
+        uint256 depositETH;
         address landlordAddress;
         address tenantAddress;
-        rentPaymentStatus paymentStatus; //Rent either paid , pending or overdue
+        rentPaymentStatus paymentStatus;
     }
 
-    //Create landlord profile
+    // Constructor
+    constructor(address _priceFeed) {
+        priceFeed = AggregatorV3Interface(_priceFeed);
+    }
+
+    // Modifiers
+    modifier onlyLandlord(address tenant) {
+        if (msg.sender != tenantToLandlord[tenant].landlordAddress) {
+            revert OnlyLandlordAllowed();
+        }
+        _;
+    }
+
+    modifier onlyTenant() {
+        if (tenantProfiles[msg.sender].tenantAddress != msg.sender) {
+            revert OnlyTenantAllowed();
+        }
+        _;
+    }
+
+    modifier agreementExists(address tenant, address landlord) {
+        if (masterAgreements[tenant][landlord].landlordAddress == address(0)) {
+            revert AgreementDoesNotExist();
+        }
+        _;
+    }
+
+    // Profile creation functions
     function createLandlordProfile(
-        /** Error Checking information to implmenet 
-             - Making sure there is no dupicate profile (check address)
-            - Create a custom modifer to check for duplicate profile
-            */
         address landlordAddress,
         string memory landlordName,
         string memory landlordContact
     ) public {
+        if (landlordProfiles[landlordAddress].landlordAddress != address(0)) {
+            revert LandlordProfileAlreadyExists();
+        }
+
         landlordProfiles[landlordAddress] = Landlord(
             landlordAddress,
             landlordName,
@@ -73,17 +184,19 @@ contract RentPaymentSystem {
         );
     }
 
-    //Create tenant  profile
     function createTenantProfile(
-        /** Error Checking information to implmenet 
-         - Making sure there is no dupicate profile (check address)
-         - Create a custom modifer to check for duplicate profile
-        */
         address tenantAddress,
         string memory tenantName,
         string memory tenantEmail,
         address landlordAddress
     ) public {
+        if (tenantProfiles[tenantAddress].tenantAddress != address(0)) {
+            revert TenantProfileAlreadyExists();
+        }
+        if (landlordProfiles[landlordAddress].landlordAddress == address(0)) {
+            revert LandlordProfileDoesNotExist();
+        }
+
         tenantProfiles[tenantAddress] = Tenant(
             tenantAddress,
             tenantName,
@@ -92,31 +205,44 @@ contract RentPaymentSystem {
         );
     }
 
-    //Creates new tenancy agreement
     function createAgreement(
-        uint256 startDate, //Start of tenancy
-        uint256 endDate, // End of tenancy
-        uint256 dueDate, //Day when rent is due
-        uint256 period, //How often rent is paid (30 days)
-        uint256 rentUSD, // Rent amount USD
-        uint256 rentETH, // Rent amount ETH
-        uint256 depositUSD, // Deposit Amount USD
-        uint256 depositETH, // Deposit Amount ETH
-        address landlordAddress, // Landlord address
-        address tenantAddress, // Tenant address
-        rentPaymentStatus paymentStatus // Payment status (paid, pending, overdue)
+        uint256 startDate,
+        uint256 endDate,
+        uint256 dueDate,
+        uint256 period,
+        uint256 rentUSD,
+        uint256 rentETH,
+        uint256 depositUSD,
+        uint256 depositETH,
+        address landlordAddress,
+        address tenantAddress,
+        rentPaymentStatus paymentStatus
     ) public {
-        /** Error checking information to implement
-         * Tenant must exist
-         * Landlord must exist
-         * Start date must be less than end date
-         * Due date must be less than end date
-         * Start date must be less than due date
-         * Tenant and landlord cannot be the same
-         * Tenant cannot have another landlord
-         */
+        if (tenantProfiles[tenantAddress].tenantAddress == address(0)) {
+            revert TenantProfileDoesNotExist();
+        }
+        if (landlordProfiles[landlordAddress].landlordAddress == address(0)) {
+            revert LandlordProfileDoesNotExist();
+        }
+        if (startDate >= endDate) {
+            revert StartDateMustBeBeforeEndDate();
+        }
+        if (dueDate > endDate) {
+            revert DueDateMustBeBeforeOrEqualToEndDate();
+        }
+        if (startDate >= dueDate) {
+            revert StartDateMustBeBeforeDueDate();
+        }
+        if (tenantAddress == landlordAddress) {
+            revert TenantAndLandlordCannotBeSame();
+        }
+        if (
+            masterAgreements[tenantAddress][landlordAddress].landlordAddress !=
+            address(0)
+        ) {
+            revert AgreementAlreadyExists();
+        }
 
-        //Create Agreement
         agreements[nextAgreementID] = TenancyAgreement(
             startDate,
             endDate,
@@ -131,10 +257,13 @@ contract RentPaymentSystem {
             paymentStatus
         );
 
-        //Add new tenant to Landlord => tenant list
         landlordToTenants[landlordAddress].push(tenantProfiles[tenantAddress]);
+        tenantToLandlord[tenantAddress] = landlordProfiles[landlordAddress];
+        landlordToAgreement[landlordAddress].push(agreements[nextAgreementID]);
+        masterAgreements[tenantAddress][landlordAddress] = agreements[
+            nextAgreementID
+        ];
 
-        //Emit event
         emit AgreementCreated(
             nextAgreementID,
             landlordAddress,
@@ -143,22 +272,225 @@ contract RentPaymentSystem {
             depositUSD
         );
 
-        // Increment agreement ID
         nextAgreementID++;
     }
 
-    // Tenant Deposits rent here
-    function payRent(address landlord) external payable {}
+    function payRent() external payable onlyTenant {
+        address landlordAddress = tenantToLandlord[msg.sender].landlordAddress;
+        if (
+            masterAgreements[msg.sender][landlordAddress].landlordAddress ==
+            address(0)
+        ) {
+            revert AgreementDoesNotExist();
+        }
+        if (
+            masterAgreements[msg.sender][landlordAddress].paymentStatus ==
+            rentPaymentStatus.PAID
+        ) {
+            revert RentAlreadyPaid();
+        }
+        if (!isDepositPaid[msg.sender]) {
+            revert DepositMustBePaidFirst();
+        }
 
-    //Landlord withdraws the rent the tenant payed
-    function withdrawRent(address tenant) external {}
+        uint256 requiredEth = PriceConverter.getRequiredEthForUsd(
+            masterAgreements[msg.sender][landlordAddress].rentUSD,
+            priceFeed
+        );
 
-    //Checks if tenant has paid late or is overdue
-    function checkLatePayment(address tenant, address landlord) external {}
+        if (msg.value < requiredEth) {
+            revert NotEnoughETHSent();
+        }
 
-    //Terminates lease , destroying the agreement
-    function terminateLease(address tenant) external {}
+        // Store the rent payment for this tenant-landlord pair
+        rentBalance[msg.sender][landlordAddress] = msg.value;
 
-    //Landlord refunds the deposit to the tenant
-    function refundDeposit(address tenant) external {}
+        // Update payment status
+        masterAgreements[msg.sender][landlordAddress]
+            .paymentStatus = rentPaymentStatus.PAID;
+
+        emit RentPaid(msg.sender, landlordAddress, msg.value);
+    }
+
+    function payDeposit() external payable onlyTenant {
+        address landlordAddress = tenantToLandlord[msg.sender].landlordAddress;
+        if (
+            masterAgreements[msg.sender][landlordAddress].landlordAddress ==
+            address(0)
+        ) {
+            revert AgreementDoesNotExist();
+        }
+        if (isDepositPaid[msg.sender]) {
+            revert DepositAlreadyPaid();
+        }
+
+        uint256 requiredEth = PriceConverter.getRequiredEthForUsd(
+            masterAgreements[msg.sender][landlordAddress].depositUSD,
+            priceFeed
+        );
+
+        if (msg.value < requiredEth) {
+            revert NotEnoughETHSent();
+        }
+
+        // Store the deposit amount
+        depositBalance[msg.sender] = msg.value;
+        isDepositPaid[msg.sender] = true;
+
+        emit DepositPaid(msg.sender, landlordAddress, msg.value);
+    }
+
+    function withdrawRent(
+        address tenant
+    ) external onlyLandlord(tenant) agreementExists(tenant, msg.sender) {
+        if (
+            masterAgreements[tenant][msg.sender].paymentStatus !=
+            rentPaymentStatus.PAID
+        ) {
+            revert RentNotPaid();
+        }
+        if (block.timestamp <= masterAgreements[tenant][msg.sender].dueDate) {
+            revert CannotWithdrawBeforeDueDate();
+        }
+
+        uint256 rentAmount = rentBalance[tenant][msg.sender];
+        if (rentAmount == 0) {
+            revert NoRentToWithdraw();
+        }
+
+        // Reset the balance before transfer (reentrancy protection)
+        rentBalance[tenant][msg.sender] = 0;
+
+        // Update payment status to pending for next period
+        masterAgreements[tenant][msg.sender].paymentStatus = rentPaymentStatus
+            .PENDING;
+
+        // Transfer rent to landlord
+        (bool success, ) = payable(msg.sender).call{value: rentAmount}("");
+        if (!success) {
+            revert TransferFailed();
+        }
+
+        emit RentReleased(msg.sender, tenant, rentAmount);
+        emit RentWithdrawn(msg.sender, tenant, rentAmount);
+    }
+
+    function refundDeposit(
+        address tenant
+    ) external onlyLandlord(tenant) agreementExists(tenant, msg.sender) {
+        if (block.timestamp <= masterAgreements[tenant][msg.sender].endDate) {
+            revert LeaseStillActive();
+        }
+        if (!isDepositPaid[tenant]) {
+            revert NoDepositToRefund();
+        }
+
+        uint256 depositAmount = depositBalance[tenant];
+        if (depositAmount == 0) {
+            revert NoDepositBalance();
+        }
+
+        // Reset deposit status and balance before transfer
+        depositBalance[tenant] = 0;
+        isDepositPaid[tenant] = false;
+
+        // Transfer deposit back to tenant
+        (bool success, ) = payable(tenant).call{value: depositAmount}("");
+        if (!success) {
+            revert DepositRefundFailed();
+        }
+
+        emit DepositRefunded(tenant, msg.sender, depositAmount);
+    }
+
+    function terminateLease(
+        address tenant
+    ) external onlyLandlord(tenant) agreementExists(tenant, msg.sender) {
+        // Set end date to now to effectively terminate the lease
+        masterAgreements[tenant][msg.sender].endDate = block.timestamp;
+
+        // Reset payment status
+        masterAgreements[tenant][msg.sender].paymentStatus = rentPaymentStatus
+            .PENDING;
+    }
+
+    // Chainlink Automation functions
+    function checkUpkeep(
+        bytes calldata /* checkData */
+    )
+        external
+        view
+        override
+        returns (bool upkeepNeeded, bytes memory /* performData */)
+    {
+        // Check if any tenant has overdue rent
+        upkeepNeeded = false;
+
+        // This is a simplified check - in practice, you'd want to maintain an array of active agreements
+        // For now, we'll return false and implement the full logic when we have a way to iterate through agreements
+
+        return (upkeepNeeded, "");
+    }
+
+    function performUpkeep(bytes calldata /* performData */) external override {
+        // This function would mark overdue payments as late
+        // Implementation depends on how we want to iterate through active agreements
+    }
+
+    function checkLatePayment(
+        address tenant,
+        address landlord
+    ) external view returns (bool isLate) {
+        if (masterAgreements[tenant][landlord].landlordAddress == address(0)) {
+            revert AgreementDoesNotExist();
+        }
+
+        TenancyAgreement memory agreement = masterAgreements[tenant][landlord];
+
+        return (block.timestamp > agreement.dueDate &&
+            agreement.paymentStatus != rentPaymentStatus.PAID);
+    }
+
+    function markPaymentLate(address tenant, address landlord) external {
+        if (masterAgreements[tenant][landlord].landlordAddress == address(0)) {
+            revert AgreementDoesNotExist();
+        }
+        if (block.timestamp <= masterAgreements[tenant][landlord].dueDate) {
+            revert PaymentNotYetDue();
+        }
+        if (
+            masterAgreements[tenant][landlord].paymentStatus ==
+            rentPaymentStatus.PAID
+        ) {
+            revert PaymentAlreadyMade();
+        }
+
+        masterAgreements[tenant][landlord].paymentStatus = rentPaymentStatus
+            .OVERDUE;
+
+        emit LatePayment(
+            tenant,
+            landlord,
+            masterAgreements[tenant][landlord].dueDate
+        );
+    }
+
+    // View functions
+    function getRentBalance(
+        address tenant,
+        address landlord
+    ) external view returns (uint256) {
+        return rentBalance[tenant][landlord];
+    }
+
+    function getDepositBalance(address tenant) external view returns (uint256) {
+        return depositBalance[tenant];
+    }
+
+    function getAgreement(
+        address tenant,
+        address landlord
+    ) external view returns (TenancyAgreement memory) {
+        return masterAgreements[tenant][landlord];
+    }
 }
