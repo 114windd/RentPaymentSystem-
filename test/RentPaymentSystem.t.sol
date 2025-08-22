@@ -9,12 +9,9 @@ import {Test, console} from "forge-std/Test.sol";
 import {StdCheats} from "forge-std/StdCheats.sol";
 import {MockV3Aggregator} from "../../test/MockV3Aggregator.sol";
 
-contract FundMeTest is ZkSyncChainChecker, CodeConstants, StdCheats, Test {
+contract RentPaymentSystemTest is Test, CodeConstants, StdCheats {
     RentPaymentSystem public rentPaymentSystem;
     HelperConfig public helperConfig;
-
-    uint256 public DECIMALS = 8;
-    int256 public INITIAL_PRICE = 2000e8;
 
     function setUp() external {
         if (helperConfig.localNetworkConfig.priceFeed != address(0)) {
