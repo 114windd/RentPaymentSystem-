@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+pragma solidity ^0.8.19;
 /**
  * @title RentPaymentSystem
  * @author Korede
@@ -8,7 +8,7 @@ pragma solidity ^0.8.24;
 
 import {AggregatorV3Interface} from "../lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 import {AutomationCompatibleInterface} from "../lib/chainlink-evm/contracts/src/v0.8/automation/interfaces/AutomationCompatibleInterface.sol";
-import {PriceConverter} from "./PriceConverter.sol";
+import "./PriceConverter.sol";
 
 contract RentPaymentSystem is AutomationCompatibleInterface {
     AggregatorV3Interface public priceFeed;
